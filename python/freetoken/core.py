@@ -43,6 +43,14 @@ class Req:
     # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
+    # Raw multimodal payload from the tokenizer worker (pixel bytes + grid), turned into
+    # mm_embeds by the scheduler at prefill time. Mutually exclusive in practice with
+    # mm_embeds (the offline path precomputes embeddings; the online path ships pixels).
+    mm_inputs: dict | None = None
+    # mRoPE (qwen4_exp): per-prompt 3D positions [3, prompt_len] (CPU int64) and the
+    # decode-time rope delta. None / 0 for text-only requests and non-mrope models.
+    mrope_positions: torch.Tensor | None = None
+    mrope_delta: int = 0
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
@@ -135,6 +143,13 @@ class Batch:
     attn_metadata: BaseAttnMetadata = field(init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None)
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
+    # mRoPE (qwen4_exp image requests): rope lookup redirect. None for text-only batches.
+    # rope_positions [T] int32: per-extend-token rope key -- a row index into mrope_cos_sin
+    # (prefill) or a delta-shifted logical position into the standard rope cache (decode).
+    rope_positions: torch.Tensor | None = field(default=None, init=False)
+    # mrope_cos_sin [rows, rotary_dim] float32: per-token cat(cos, sin) table for prefill
+    # batches containing image requests (see models/qwen4_exp/mrope.py).
+    mrope_cos_sin: torch.Tensor | None = field(default=None, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()
     # advances cached_len), so the prefill log reports the tokens actually forwarded and
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the

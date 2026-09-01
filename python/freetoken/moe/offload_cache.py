@@ -339,7 +339,10 @@ class OffloadMoeCache:
                     name, layer_id, source.shape, source.dtype,
                 )
             self.bank_sources[name] = list(per_layer)
-            self.bank_caches[name] = torch.empty(
+            # zeros, not empty: a zero-weighted route (hybrid CPU-overflow clamp, or a
+            # non-owned expert under expert-parallel TP) still feeds its slot row to the
+            # grouped GEMM, and 0 * garbage is NaN while 0 * 0 is 0.
+            self.bank_caches[name] = torch.zeros(
                 (self.cache_size, *head.shape[1:]),
                 dtype=head.dtype,
                 device=self.device,
@@ -459,7 +462,8 @@ class OffloadMoeCache:
         # 3. Reallocate the slot cache from the retained host sources.
         for name in self.bank_schema:
             head = self.bank_sources[name][0]
-            self.bank_caches[name] = torch.empty(
+            # zeros, not empty: zero-weighted routes read a slot row (see set_bank_sources).
+            self.bank_caches[name] = torch.zeros(
                 (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]

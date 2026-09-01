@@ -868,3 +868,299 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+# ======================================================================================
+# Expert-parallel TP (id % tp_size == rank): routing partition + sharded banks
+# ======================================================================================
+
+
+def _patch_tp(monkeypatch, rank: int, size: int) -> None:
+    import freetoken.distributed.info as dist_info
+    from freetoken.distributed import DistributedInfo
+
+    monkeypatch.setattr(dist_info, "_TP_INFO", DistributedInfo(rank=rank, size=size))
+
+
+@pytest.fixture
+def noop_comm(monkeypatch):
+    """all_reduce as identity -- the test sums the per-rank partials itself."""
+    from freetoken.distributed import DistributedCommunicator
+    from freetoken.distributed.impl import DistributedImpl
+
+    class _NoOp(DistributedImpl):
+        def all_reduce(self, x):
+            return x
+
+        def all_gather(self, x):
+            return x
+
+    monkeypatch.setattr(DistributedCommunicator, "plugins", [_NoOp()])
+
+
+def test_partition_topk_experts_zeroes_and_remaps():
+    from freetoken.layers.moe import partition_topk_experts
+
+    weights = torch.tensor([[0.5, 0.3, 0.2]], dtype=torch.float32)
+    ids = torch.tensor([[0, 3, 5]], dtype=torch.int32)
+    w0, i0 = partition_topk_experts(weights, ids, rank=0, size=2)
+    w1, i1 = partition_topk_experts(weights, ids, rank=1, size=2)
+    assert i0.tolist() == [[0, -1, -1]]  # expert 0 -> local row 0; the rest are -1
+    assert w0.tolist() == [[0.5, 0.0, 0.0]]
+    assert i1.tolist() == [[-1, 1, 2]]  # experts 3/5 -> local rows 1/2
+    assert w1[0].tolist() == pytest.approx([0.0, 0.3, 0.2])
+    assert i0.dtype == torch.int32 and w0.dtype == torch.float32
+    # the original tensors are not mutated
+    assert ids.tolist() == [[0, 3, 5]]
+    assert weights[0].tolist() == pytest.approx([0.5, 0.3, 0.2])
+
+
+def _torch_copy_missing(cache) -> None:
+    """copy_missing without the fast_index_copy JIT: the same staged rows via index_copy_."""
+    n = int(cache.num_indices.sum().item())
+    if n == 0:
+        return
+    dst = cache.evict_slots[:n].long()
+    src = cache.src_indices[:n].long()
+    for per_layer, cache_tensor in cache.banks:
+        cache_tensor.index_copy_(0, dst, per_layer[cache._pending_src_layer][src])
+
+
+def _tp_rank_layer_and_cache(monkeypatch, rank: int, gate_up_full, down_full, cache_size: int):
+    """One rank's OffloadMoELayer + cache over its owned experts (global id % 2 == rank)."""
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _patch_tp(monkeypatch, rank, 2)
+    num_experts = gate_up_full.shape[0]
+    layer = OffloadMoELayer(
+        layer_id=0, num_experts=num_experts, top_k=3,
+        hidden_size=gate_up_full.shape[2], intermediate_size=gate_up_full.shape[1] // 2,
+    )
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=num_experts // 2, cache_size=cache_size,
+        device=gate_up_full.device,
+    )
+    cache.set_bank_sources({
+        "gate_up": [gate_up_full[rank::2].contiguous()],
+        "down": [down_full[rank::2].contiguous()],
+    })
+    monkeypatch.setattr(cache, "copy_missing", lambda c=cache: _torch_copy_missing(c))
+    layer.offload_cache = cache
+    assert layer.num_experts == num_experts // 2 and layer.num_experts_global == num_experts
+    return layer, cache
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_offload_decode_tp2_expert_partition_matches_full(monkeypatch, noop_comm):
+    from freetoken.moe.fused import fused_experts_decode_impl
+
+    dev = torch.device("cuda")
+    E, H, I = 8, 32, 16
+    torch.manual_seed(0)
+    gate_up_full = torch.randn(E, 2 * I, H, dtype=torch.bfloat16, device=dev) * 0.1
+    down_full = torch.randn(E, H, I, dtype=torch.bfloat16, device=dev) * 0.1
+    hidden = torch.randn(1, H, dtype=torch.bfloat16, device=dev)
+    weights = torch.tensor([[0.5, 0.3, 0.2]], dtype=torch.float32, device=dev)
+    ids = torch.tensor([[0, 3, 5]], dtype=torch.int32, device=dev)  # rank0: {0}, rank1: {3,5}
+
+    ref = fused_experts_decode_impl(hidden, gate_up_full, down_full, weights, ids.clone(), "silu", False)
+
+    partials = []
+    for rank in (0, 1):
+        layer, _cache = _tp_rank_layer_and_cache(monkeypatch, rank, gate_up_full, down_full, E)
+        monkeypatch.setattr(
+            "freetoken.layers.moe.fused_topk",
+            lambda *, hidden_states, gating_output, topk, renormalize: (
+                weights, ids.clone()
+            ),
+        )
+        partials.append(layer.decode_forward(hidden, torch.zeros(1, E, device=dev)))
+    torch.testing.assert_close(
+        (partials[0] + partials[1]).float(), ref.float(), rtol=2e-2, atol=2e-2
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_offload_decode_tp2_fetches_owned_experts_only(monkeypatch, noop_comm):
+    dev = torch.device("cuda")
+    E, H, I = 8, 32, 16
+    torch.manual_seed(0)
+    gate_up_full = torch.randn(E, 2 * I, H, dtype=torch.bfloat16, device=dev)
+    down_full = torch.randn(E, H, I, dtype=torch.bfloat16, device=dev)
+    hidden = torch.randn(1, H, dtype=torch.bfloat16, device=dev)
+    weights = torch.tensor([[0.5, 0.3, 0.2]], dtype=torch.float32, device=dev)
+    ids = torch.tensor([[0, 3, 5]], dtype=torch.int32, device=dev)
+
+    resident = []
+    for rank in (0, 1):
+        layer, cache = _tp_rank_layer_and_cache(monkeypatch, rank, gate_up_full, down_full, E)
+        monkeypatch.setattr(
+            "freetoken.layers.moe.fused_topk",
+            lambda *, hidden_states, gating_output, topk, renormalize: (
+                weights, ids.clone()
+            ),
+        )
+        layer.decode_forward(hidden, torch.zeros(1, E, device=dev))
+        torch.cuda.synchronize()
+        resident.append(sorted(cache.slot_for_id[0][cache.slot_for_id[0] >= 0].tolist()))
+    # rank0 fetches only its routed expert (global 0 -> local 0); rank1 fetches its two
+    # (global 3/5 -> local 1/2) plus the dump row 0 the clamped non-owned entries land on
+    # (computed with weight 0, never crossing PCIe as an extra fetch of a NON-owned expert).
+    assert resident[0] == [0]
+    assert resident[1] == [0, 1, 2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_offload_prefill_tp2_expert_partition_matches_full(monkeypatch, noop_comm):
+    from freetoken.moe.fused import fused_experts_impl
+
+    dev = torch.device("cuda")
+    E, H, I = 8, 32, 16
+    torch.manual_seed(0)
+    gate_up_full = torch.randn(E, 2 * I, H, dtype=torch.bfloat16, device=dev) * 0.1
+    down_full = torch.randn(E, H, I, dtype=torch.bfloat16, device=dev) * 0.1
+    hidden = torch.randn(5, H, dtype=torch.bfloat16, device=dev)
+    weights = torch.tensor(
+        [[0.5, 0.3, 0.2], [0.4, 0.4, 0.2], [0.1, 0.7, 0.2], [0.3, 0.3, 0.4], [0.6, 0.2, 0.2]],
+        dtype=torch.float32, device=dev,
+    )
+    ids = torch.tensor(
+        [[0, 3, 5], [1, 2, 7], [6, 4, 1], [2, 5, 0], [7, 1, 4]], dtype=torch.int32, device=dev
+    )
+    ref = fused_experts_impl(hidden.clone(), gate_up_full, down_full, weights, ids.clone(), "silu", False)
+
+    partials = []
+    for rank in (0, 1):
+        layer, _cache = _tp_rank_layer_and_cache(monkeypatch, rank, gate_up_full, down_full, E)
+        monkeypatch.setattr(
+            "freetoken.layers.moe.fused_topk",
+            lambda *, hidden_states, gating_output, topk, renormalize: (
+                weights, ids.clone()
+            ),
+        )
+        partials.append(layer.prefill_forward(hidden.clone(), torch.zeros(5, E, device=dev)))
+    torch.testing.assert_close(
+        (partials[0] + partials[1]).float(), ref.float(), rtol=2e-2, atol=2e-2
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_offload_hybrid_tp2_cpu_sees_only_owned_local_ids(monkeypatch, noop_comm):
+    dev = torch.device("cuda")
+    E, H, I = 8, 32, 16
+    torch.manual_seed(0)
+    gate_up_full = torch.randn(E, 2 * I, H, dtype=torch.bfloat16, device=dev) * 0.1
+    down_full = torch.randn(E, H, I, dtype=torch.bfloat16, device=dev) * 0.1
+    hidden = torch.randn(1, H, dtype=torch.bfloat16, device=dev)
+    weights = torch.tensor([[0.5, 0.3, 0.2]], dtype=torch.float32, device=dev)
+    ids = torch.tensor([[0, 3, 5]], dtype=torch.int32, device=dev)
+
+    class FakeExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def decode_submit(self, layer_id, hidden_states, topk_weights, topk_ids):
+            self.calls.append((topk_weights.clone(), topk_ids.clone()))
+            return None
+
+        def decode_sync(self, pending):
+            return torch.zeros(1, H, dtype=torch.bfloat16, device=dev)
+
+    from freetoken.moe.fused import fused_experts_decode_impl
+
+    ref = fused_experts_decode_impl(hidden, gate_up_full, down_full, weights, ids.clone(), "silu", False)
+    partials = []
+    for rank in (0, 1):
+        layer, cache = _tp_rank_layer_and_cache(monkeypatch, rank, gate_up_full, down_full, E)
+        cache.decode_target = "hybrid"
+        cache.hybrid_max_fetch = E  # no overflow -> every owned miss is fetched
+        executor = FakeExecutor()
+        cache.set_cpu_executor(executor)
+        monkeypatch.setattr(
+            "freetoken.layers.moe.fused_topk",
+            lambda *, hidden_states, gating_output, topk, renormalize: (
+                weights, ids.clone()
+            ),
+        )
+        partials.append(layer.decode_forward(hidden, torch.zeros(1, E, device=dev)))
+        torch.cuda.synchronize()
+        (cpu_w, cpu_ids), = executor.calls
+        # the CPU side never sees a non-owned id nor a global id: -1 everywhere here
+        # (every owned miss fits under the fetch cap), and non-owned weights are 0.
+        assert cpu_ids.tolist() == [[-1, -1, -1]]
+        want_w = [w if g % 2 == rank else 0.0 for g, w in zip(ids[0].tolist(), weights[0].tolist())]
+        assert cpu_w[0].tolist() == want_w
+    torch.testing.assert_close(
+        (partials[0] + partials[1]).float(), ref.float(), rtol=2e-2, atol=2e-2
+    )
+
+
+def test_nvfp4_expert_source_banks_tp_shard(tmp_path):
+    """Each rank's source banks hold exactly its owned experts at local rows id // 2."""
+    from types import SimpleNamespace
+
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks
+    from freetoken.models.qwen4_exp.weight import _NVFP4_SOURCE_SPEC
+
+    E, H, I = 4, 32, 16
+    raw = {}
+    for expert in range(E):
+        base = f"model.language_model.layers.0.mlp.experts.{expert}"
+        # fingerprint: every byte of this expert's payload is its global id
+        raw[f"{base}.gate_proj.weight"] = torch.full((I, H // 2), expert, dtype=torch.uint8)
+        raw[f"{base}.up_proj.weight"] = torch.full((I, H // 2), expert, dtype=torch.uint8)
+        raw[f"{base}.down_proj.weight"] = torch.full((H, I // 2), expert, dtype=torch.uint8)
+        raw[f"{base}.gate_proj.weight_scale"] = torch.ones(I, H // 16, dtype=torch.float8_e4m3fn)
+        raw[f"{base}.up_proj.weight_scale"] = torch.ones(I, H // 16, dtype=torch.float8_e4m3fn)
+        raw[f"{base}.down_proj.weight_scale"] = torch.ones(H, I // 16, dtype=torch.float8_e4m3fn)
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            raw[f"{base}.{proj}.weight_scale_2"] = torch.tensor(0.5)
+    folder = tmp_path / "ckpt"
+    folder.mkdir()
+    save_file(raw, str(folder / "model.safetensors"))
+    import json
+
+    (folder / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": {n: "model.safetensors" for n in raw}})
+    )
+
+    config = SimpleNamespace(num_experts=E, hidden_size=H, moe_intermediate_size=I,
+                             num_moe_layers=1)
+    for rank in (0, 1):
+        banks = load_nvfp4_expert_source_banks(
+            str(folder), config, _NVFP4_SOURCE_SPEC,
+            drop_page_cache=lambda path: None, primary=False,
+            expert_shard=(rank, 2),
+        )
+        assert banks["gate_up_packed"][0].shape == (E // 2, 2 * I, H // 2)
+        for local in range(E // 2):
+            glob = local * 2 + rank
+            assert (banks["gate_up_packed"][0][local] == glob).all()
+            assert (banks["down_packed"][0][local] == glob).all()
+        with safe_open(str(folder / "model.safetensors"), framework="pt") as f:
+            gate_g = f.get_tensor(
+                f"model.language_model.layers.0.mlp.experts.{rank}.gate_proj.weight_scale_2"
+            ).to(torch.float16)
+        assert torch.equal(banks["gate_up_global"][0][0, :I], gate_g.reshape(1).expand(I))
+
+
+def test_local_num_experts_partitions_at_tp2():
+    from types import SimpleNamespace
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.engine import _local_num_experts
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(num_experts=512),
+        tp_info=DistributedInfo(rank=0, size=1),
+    )
+    assert _local_num_experts(config) == 512
+    object.__setattr__(config, "tp_info", DistributedInfo(rank=1, size=2))
+    assert _local_num_experts(config) == 256
+    config.model_config.num_experts = 7
+    with pytest.raises(ValueError, match="num_experts % tp_size"):
+        _local_num_experts(config)

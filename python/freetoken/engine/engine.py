@@ -50,6 +50,22 @@ def _flashinfer_available() -> bool:
     return is_flashinfer_installed()
 
 
+def _local_num_experts(config: EngineConfig) -> int:
+    """Experts HOSTED per rank by the offload MoE cache: the expert-parallel TP split
+    (rank ``r`` owns the experts ``id % tp_size == r``;
+    ``layers.moe.partition_topk_experts`` routes by the same rule). Identity at TP=1."""
+    num_experts = config.model_config.num_experts
+    tp_size = config.tp_info.size
+    if tp_size == 1:
+        return num_experts
+    if num_experts % tp_size:
+        raise ValueError(
+            f"expert-parallel TP needs num_experts % tp_size == 0, got "
+            f"{num_experts} experts on {tp_size} ranks"
+        )
+    return num_experts // tp_size
+
+
 def _sgl_flash_attn_available() -> bool:
     try:
         from sgl_kernel.flash_attn import flash_attn_with_kvcache  # noqa: F401
@@ -479,7 +495,7 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
-        num_experts = config.model_config.num_experts
+        num_experts = _local_num_experts(config)
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
@@ -602,12 +618,14 @@ class Engine:
                     f"--moe-cache-auto resolved moe_cache_size={size} "
                     f"num_pages={pages} (prefill_overlap={overlap})"
                 )
-            _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
+            _require_offload_cache_size(config.moe_cache_size, _local_num_experts(config))
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
                 # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
+                # num_experts is the PER-RANK count: expert-parallel TP hosts
+                # num_experts // tp_size experts per rank (see _local_num_experts).
                 num_layers=config.model_config.num_moe_layers,
-                num_experts=config.model_config.num_experts,
+                num_experts=_local_num_experts(config),
                 cache_size=config.moe_cache_size,
                 device=self.device,
                 cache_policy=config.moe_cache_policy,
@@ -1329,7 +1347,7 @@ def _adjust_config(config: EngineConfig):
     _validate_attention_backend_choice(config, override, required_attn_types)
 
     if config.moe_cache_rate is not None:
-        total_experts = config.model_config.num_moe_layers * config.model_config.num_experts
+        total_experts = config.model_config.num_moe_layers * _local_num_experts(config)
         override("moe_cache_size", math.ceil(total_experts * config.moe_cache_rate))
 
     # The CPU MoE executor supports the silu/gelu family plus the clamped
@@ -1453,7 +1471,7 @@ def _adjust_config(config: EngineConfig):
         # the GPU only holds the two-layer prefill double buffer. So the slot cache is
         # fixed at exactly two expert layers (prefill overlap requires >= 2*num_experts)
         # and --moe-cache-size / --moe-cache-auto / --moe-cache-rate do not apply.
-        num_experts = config.model_config.num_experts
+        num_experts = _local_num_experts(config)
         if getattr(config, "moe_cache_auto", False):
             override("moe_cache_auto", False)
         override("moe_cache_size", 2 * num_experts)
@@ -1497,6 +1515,39 @@ def _adjust_config(config: EngineConfig):
                 f"{(config.num_token_override // config.page_size + 1) * config.page_size}"
             )
         override("num_page_override", config.num_token_override // config.page_size)
+
+    # A rope_scaling override extends the rotary table past the checkpoint's
+    # max_position (off-label long-context serving). Applied before the bounds guard
+    # below, to both the model-level config and every attention group that shares it.
+    rope_override = getattr(config, "rope_scaling_override", None)
+    if rope_override:
+        import json as _json
+        from dataclasses import replace as _dc_replace
+
+        scaling = _json.loads(rope_override)
+        rotary0 = getattr(model_config, "rotary_config", None)
+        if rotary0 is None:
+            raise ValueError("--rope-scaling given but the model has no rotary config")
+        factor = float(scaling.get("factor", 1.0))
+        orig_max = int(
+            scaling.get("original_max_position_embeddings", rotary0.max_position)
+        )
+        new_max = int(orig_max * factor)
+        seq_ov = getattr(config, "max_seq_len_override", None)
+        if seq_ov is not None and seq_ov > new_max:
+            raise ValueError(
+                f"--max-seq-len-override {seq_ov} exceeds the extended rope table "
+                f"({new_max} = {orig_max} x {factor}); raise factor"
+            )
+        new_rotary = _dc_replace(rotary0, scaling=scaling, max_position=new_max)
+        object.__setattr__(model_config, "rotary_config", new_rotary)
+        for grp in getattr(model_config, "attention_groups", None) or ():
+            if getattr(grp, "rotary_config", None) is not None:
+                object.__setattr__(grp, "rotary_config", new_rotary)
+        logger.info(
+            f"rope_scaling override applied: factor={factor} "
+            f"table {rotary0.max_position} -> {new_max} positions"
+        )
 
     # The rope cos/sin table is baked to rotary_config.max_position, and neither rope kernel
     # bounds-checks the position it gathers with -- a longer ceiling reads past the table.

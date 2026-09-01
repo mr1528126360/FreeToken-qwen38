@@ -3,8 +3,10 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
+from freetoken.distributed import get_tp_info
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
-from freetoken.layers import BaseOP, LinearColParallelMerged
+from freetoken.layers import BaseOP, LinearColParallelMerged, LinearRowParallel
+from freetoken.utils import div_even
 
 from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
@@ -72,12 +74,23 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         assert head_k_dim == head_v_dim, (
             f"GatedDeltaNet requires head_k_dim == head_v_dim, got {head_k_dim} != {head_v_dim}"
         )
-        self.num_k_heads = num_k_heads
-        self.num_v_heads = num_v_heads
+        # TP: heads are sharded across ranks (the LinearStatePool is allocated with the
+        # same local dims), out_proj row-shards and all-reduces. The fp8 projection
+        # layouts are TP=1-only (their block scales do not shard). Like the attention
+        # merged GEMM, LinearColParallelMerged cannot replicate heads, so the head
+        # counts must divide evenly.
+        tp_size = get_tp_info().size
+        if num_k_heads % tp_size or num_v_heads % tp_size:
+            raise NotImplementedError(
+                f"GDN needs num_key_heads/num_value_heads divisible by tp_size "
+                f"(got {num_k_heads}/{num_v_heads} heads on {tp_size} ranks)"
+            )
+        self.num_k_heads = div_even(num_k_heads, tp_size)
+        self.num_v_heads = div_even(num_v_heads, tp_size)
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        self.key_dim = num_k_heads * head_k_dim
-        self.value_dim = num_v_heads * head_v_dim
+        self.key_dim = self.num_k_heads * head_k_dim
+        self.value_dim = self.num_v_heads * head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = conv_kernel_size
         # qkv|z carry a weight scale (block-fp8 weight_scale_inv, or per-tensor FP8
@@ -87,8 +100,17 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
 
-        self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
+        # Full (unsharded) split sizes; the layers below shard them, and the loader
+        # shards head-aware (q|k|v blocks inside the conv segment) to match.
+        full_split = [
+            2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim,
+            num_v_heads * head_v_dim,
+            num_v_heads,
+            num_v_heads,
+        ]
+        self._in_proj_split = [div_even(s, tp_size) for s in full_split]  # local, for forward
         if self._fp8:
+            assert tp_size == 1, "fp8 GDN projections are TP=1-only (block scales do not shard)"
             ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
             self.in_proj_qkvz = ColMerged(
                 hidden_size, [self.conv_dim, self.value_dim], has_bias=False
@@ -98,21 +120,28 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             )
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
-            self.in_proj = LinearColParallelMerged(hidden_size, self._in_proj_split, has_bias=False)
+            self.in_proj = LinearColParallelMerged(hidden_size, full_split, has_bias=False)
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
         # per-call .float() upcast in the decode wrapper. The weight loader exempts
         # *.A_log / *.dt_bias from the model-dtype downcast.
-        self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
-        self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
+        self.dt_bias = torch.empty(self.num_v_heads, dtype=torch.float32)
+        self.A_log = torch.empty(self.num_v_heads, dtype=torch.float32)
         self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
         # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
         # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
-        # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
-        self.out_proj = make_replicated_quant(
-            expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
-        )
+        # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4. Under TP the
+        # bf16 out_proj row-shards over the value heads (the quant layouts stay TP=1-only).
+        if self._fp8 or attn_quant == "nvfp4":
+            assert tp_size == 1, "quantized GDN out_proj is TP=1-only"
+            self.out_proj = make_replicated_quant(
+                expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
+            )
+        else:
+            self.out_proj = LinearRowParallel(
+                num_v_heads * head_v_dim, hidden_size, has_bias=False
+            )
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()

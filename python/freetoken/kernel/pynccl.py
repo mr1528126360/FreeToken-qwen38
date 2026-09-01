@@ -27,7 +27,35 @@ else:
 
 @functools.cache
 def _load_nccl_module() -> Module:
-    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
+    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=_nccl_ldflags())
+
+
+def _nccl_ldflags() -> list[str]:
+    """``-lnccl`` plus the library dir when NCCL comes from the pip nvidia-nccl wheel.
+
+    The wheel ships ``libnccl.so.2`` WITHOUT the ``libnccl.so`` dev symlink, so a bare
+    ``-lnccl`` fails to link on systems with no system NCCL; ``-l:libnccl.so.2`` links
+    the soname directly. NCCL_HOME / a system-wide install keep working unchanged.
+    """
+    import os
+
+    nccl_home = os.environ.get("NCCL_HOME")
+    candidates = [nccl_home] if nccl_home else []
+    try:
+        import nvidia.nccl
+
+        # namespace package: __file__ is None, __path__ holds the search dirs
+        candidates.extend(
+            os.path.join(p, "lib") for p in getattr(nvidia.nccl, "__path__", [])
+        )
+    except ImportError:
+        pass
+    for libdir in candidates:
+        if libdir and os.path.exists(os.path.join(libdir, "libnccl.so")):
+            return [f"-L{libdir}", "-lnccl"]
+        if libdir and os.path.exists(os.path.join(libdir, "libnccl.so.2")):
+            return [f"-L{libdir}", "-l:libnccl.so.2"]
+    return ["-lnccl"]
 
 
 @functools.cache

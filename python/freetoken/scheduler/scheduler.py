@@ -489,6 +489,23 @@ class Scheduler(SchedulerIOMixin):
                     "Dropping request %d because its abort arrived before admission", msg.uid
                 )
                 return
+            if msg.mm_inputs is not None and getattr(
+                self.config.model_config, "vision_config", None
+            ) is None:
+                # The tokenizer worker accepted the image (the checkpoint has a vision
+                # config) but the engine was started without it (FREETOKEN_LOAD_VISION).
+                self.send_result(
+                    [
+                        ErrorReplyMsg(
+                            uid=msg.uid,
+                            error=(
+                                "image inputs are not enabled on this server; restart with "
+                                "FREETOKEN_LOAD_VISION=1 to load the vision tower"
+                            ),
+                        )
+                    ]
+                )
+                return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
@@ -510,6 +527,25 @@ class Scheduler(SchedulerIOMixin):
                                 f"cache budget"
                             ),
                             # OpenAI's standard class for this, for clients that read a code.
+                            code="context_length_exceeded",
+                        )
+                    ]
+                )
+                return
+            if msg.mm_inputs is not None and input_len > self.config.max_extend_tokens:
+                # Multimodal prompts cannot span prefill chunks (the ViT runs once over
+                # the whole image); reject at admission instead of crashing the scheduler
+                # when prefill would chunk the request.
+                self.send_result(
+                    [
+                        ErrorReplyMsg(
+                            uid=msg.uid,
+                            error=(
+                                f"image prompt is too long: {input_len} tokens > "
+                                f"{self.config.max_extend_tokens} per-chunk limit for "
+                                f"multimodal requests; shrink the image or increase "
+                                f"--max-prefill-length"
+                            ),
                             code="context_length_exceeded",
                         )
                     ]
@@ -781,6 +817,7 @@ class Scheduler(SchedulerIOMixin):
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
+        self._maybe_build_mrope(batch)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
@@ -824,9 +861,63 @@ class Scheduler(SchedulerIOMixin):
         is kept (not cleared) so the cache manager can recognize multimodal requests and
         keep them out of the shared prefix cache (image placeholders share a token id but
         carry per-image content)."""
+        for req in batch.reqs:
+            if req.mm_inputs is not None:
+                self._encode_mm_request(req)
         parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
         if parts:
             batch.mm_embeds = torch.cat(parts, dim=0)
+
+    def _encode_mm_request(self, req: Req) -> None:
+        """Run the vision tower on a request's raw pixel payload and derive its mRoPE
+        positions. Called once per multimodal request (mm requests prefill in a single
+        chunk); every TP rank computes the same embeddings from the same broadcast payload,
+        so no cross-rank exchange is needed."""
+        import numpy as np
+
+        mm = req.mm_inputs
+        assert mm is not None and mm.get("dtype") == "bfloat16"
+        raw = np.frombuffer(mm["pixel_values"], dtype=np.uint16).copy()
+        pixel_values = (
+            torch.from_numpy(raw).view(torch.bfloat16).reshape(mm["shape"]).to(self.device)
+        )
+        grid_thw = torch.tensor(mm["grid_thw"], dtype=torch.int64, device=self.device)
+        req.mm_embeds = self.engine.model.encode_images(pixel_values, grid_thw)
+        cfg = self.config.model_config
+        qwen4_args = getattr(cfg, "qwen4_args", None)
+        if qwen4_args is not None and qwen4_args.mrope_section is not None:
+            from freetoken.models.qwen4_exp.mrope import compute_prompt_mrope
+
+            req.mrope_positions, req.mrope_delta = compute_prompt_mrope(
+                req.input_ids,
+                [tuple(g) for g in mm["grid_thw"]],
+                image_token_id=cfg.image_token_id,
+                spatial_merge_size=cfg.vision_config.spatial_merge_size,
+            )
+        req.mm_inputs = None
+
+    def _maybe_build_mrope(self, batch: Batch) -> None:
+        """mRoPE rope-lookup redirect for batches containing qwen4_exp image requests."""
+        reqs = batch.padded_reqs
+        if not any(
+            getattr(r, "mrope_positions", None) is not None or getattr(r, "mrope_delta", 0)
+            for r in reqs
+        ):
+            return
+        from freetoken.models.qwen4_exp.mrope import build_batch_rope_positions
+
+        cfg = self.config.model_config
+        rotary = cfg.rotary_config
+        build_batch_rope_positions(
+            batch,
+            self.device,
+            rope_base=rotary.base,
+            rotary_dim=rotary.rotary_dim,
+            mrope_section=cfg.qwen4_args.mrope_section,
+            # the QSA indexer ropes pooled keys at their group's FIRST position, which can
+            # sit index_ratio-1 tokens before this chunk's first extend token
+            key_margin=cfg.qwen4_args.index_ratio - 1,
+        )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first

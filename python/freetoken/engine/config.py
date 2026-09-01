@@ -76,6 +76,10 @@ class EngineConfig:
     use_dummy_weight: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
+    # JSON rope_scaling override (e.g. '{"rope_type":"yarn","factor":4.0,
+    # "original_max_position_embeddings":262144}'); applied to the model's rotary config in
+    # _adjust_config so serving past the checkpoint's max_position is possible.
+    rope_scaling_override: str | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.

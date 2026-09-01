@@ -19,9 +19,16 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.distributed import get_tp_info
+from freetoken.layers import (
+    BaseOP,
+    GemmaPlusOneRMSNorm,
+    LinearColParallelMerged,
+    LinearOProj,
+    LinearReplicated,
+)
 from freetoken.layers.rotary import get_rope
-from freetoken.utils import nvtx_annotate
+from freetoken.utils import div_even, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -114,17 +121,42 @@ class Qwen4ExpAttention(BaseOP):
     """
 
     def __init__(self, config: ModelConfig, layer_id: int) -> None:
+        tp_size = get_tp_info().size
         self.layer_id = layer_id
-        self.num_q = config.num_qo_heads
-        self.num_kv = config.num_kv_heads
+        # TP-local head counts; the QSA indexer stays replicated (its 4 scoring heads
+        # select blocks for the whole layer, and every rank must see the same selection).
+        # LinearColParallelMerged divides every output segment by tp_size, so the kv
+        # heads must divide evenly -- kv replication (num_kv < tp) is not expressible
+        # in the merged GEMM.
+        if config.num_kv_heads % tp_size:
+            raise NotImplementedError(
+                f"QSA attention needs num_kv_heads % tp_size == 0 "
+                f"(got {config.num_kv_heads} kv heads on {tp_size} ranks)"
+            )
+        self.num_q = div_even(config.num_qo_heads, tp_size)
+        self.num_kv = div_even(config.num_kv_heads, tp_size)
         self.head_dim = config.head_dim
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
-        self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
+        # Local split of the merged [2*qo | kv | kv] GEMM output (q carries the gate);
+        # the layer itself is built from the FULL sizes and shards internally.
+        self._qkv_split = [
+            div_even(config.num_qo_heads * self.head_dim * 2, tp_size),
+            div_even(config.num_kv_heads * self.head_dim, tp_size),
+            div_even(config.num_kv_heads * self.head_dim, tp_size),
+        ]
         self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False
+            config.hidden_size,
+            [
+                config.num_qo_heads * self.head_dim * 2,
+                config.num_kv_heads * self.head_dim,
+                config.num_kv_heads * self.head_dim,
+            ],
+            has_bias=False,
         )
-        self.o_proj = LinearReplicated(self.qo_attn_dim, config.hidden_size, has_bias=False)
+        self.o_proj = LinearOProj(
+            config.num_qo_heads * self.head_dim, config.hidden_size, has_bias=False
+        )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rotary = config.rotary_config
@@ -147,8 +179,25 @@ class Qwen4ExpAttention(BaseOP):
         v = v.contiguous()
         self.q_norm.forward_inplace(q)
         self.k_norm.forward_inplace(k)
-        q, k = self.rotary.forward(
-            batch.positions, q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
+        # mRoPE redirect (image batches): the scheduler sets rope_positions (+ a per-token
+        # cos/sin table at prefill) when any request carries 3D positions; both default to
+        # the standard table + logical positions otherwise. See models/qwen4_exp/mrope.py.
+        # NOTE: the rope kernel is in-place, but the views MUST be reassigned to q/k like
+        # RotaryEmbedding.forward does -- downstream (KV store, sparse attend) wants k as
+        # 2D [T, num_kv * head_dim], not the 3D [T, num_kv, head_dim] from the norm above.
+        q = q.view(-1, self.qo_attn_dim)
+        k = k.view(-1, self.kv_attn_dim)
+        rope_positions = getattr(batch, "rope_positions", None)
+        mrope_cos_sin = getattr(batch, "mrope_cos_sin", None)
+        self.rotary.apply_rope_with_cos_sin_cache_inplace(
+            positions=rope_positions if rope_positions is not None else batch.positions,
+            query=q,
+            key=k,
+            head_size=self.head_dim,
+            cos_sin_cache=(
+                mrope_cos_sin if mrope_cos_sin is not None else self.rotary._cos_sin_cache
+            ),
+            is_neox=self.rotary.is_neox,
         )
         index = self.indexer.forward(x)
         o = get_global_ctx().attn_backend.qsa_forward(

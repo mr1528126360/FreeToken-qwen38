@@ -54,9 +54,27 @@ class TokenizeManager:
         self._thinking_profile: ThinkingProfile | None = None
         self._effort_lock = threading.Lock()
         self._logged_effort_maps: set[tuple[Any, str | None]] = set()
+        from .images import ImageProcessor
+
+        model_path = getattr(tokenizer, "name_or_path", None) or getattr(
+            tokenizer, "_name_or_path", ""
+        )
+        self._image_processor = ImageProcessor(str(model_path))
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
-        results: List[torch.Tensor] = []
+        return [tokens for tokens, _mm in self.tokenize_with_mm(msgs)]
+
+    def tokenize_with_mm(
+        self, msgs: List[TokenizeMsg]
+    ) -> List[tuple[torch.Tensor, dict | None]]:
+        """tokenize + the request's multimodal payload (None for text-only prompts).
+
+        The chat template renders one ``<|image_pad|>`` per image; each is expanded to the
+        image's soft-token count, and the pixel data rides along for the scheduler to run
+        the vision tower on. Raises ValueError when the model has no image processor."""
+        from .images import expand_image_tokens, extract_image_urls
+
+        results: List[tuple[torch.Tensor, dict | None]] = []
         # TODO: batch tokenization
         for msg in msgs:
             prompt = self.render_prompt(msg)
@@ -71,7 +89,16 @@ class TokenizeManager:
                     prompt, return_tensors="pt", add_special_tokens=not templated
                 )
             )
-            results.append(input_ids.view(-1).to(torch.int32))
+            input_ids = input_ids.view(-1).to(torch.int32)
+            mm = None
+            urls = extract_image_urls(msg.text)
+            if urls:
+                mm = self._image_processor.process(urls)
+                token_counts = mm.pop("token_counts")
+                input_ids = expand_image_tokens(
+                    input_ids, self._image_processor.image_token_id, token_counts
+                )
+            results.append((input_ids, mm))
         return results
 
     def render_prompt(self, msg: TokenizeMsg) -> str:

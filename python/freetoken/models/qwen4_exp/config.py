@@ -12,6 +12,7 @@ from freetoken.models.config import (
     ModelConfig,
     RotaryConfig,
     SlotStateSpec,
+    vision_load_enabled,
 )
 
 
@@ -40,6 +41,9 @@ class Qwen4ExpArgs:
     index_head_dim: int
     index_budget: int
     index_ratio: int
+    # mRoPE frequency interleave (rope_parameters.mrope_section, e.g. (11, 11, 10)); None
+    # when the checkpoint has no mrope sections -- then every token gets plain 1D positions.
+    mrope_section: Tuple[int, int, int] | None = None
 
     @property
     def index_topk_blocks(self) -> int:
@@ -70,6 +74,47 @@ class Qwen4ExpArgs:
 
 PLE_CONV_STATE = "ple_conv"
 PLE_NGRAM_STATE = "ple_ngram_ctx"
+
+
+@dataclass(frozen=True)
+class Qwen4ExpVisionArgs:
+    """The ``vision_config`` sub-tree (Qwen3-VL-style ViT). Only parsed when vision loading
+    is enabled (``FREETOKEN_LOAD_VISION=1``); otherwise ModelConfig.vision_config stays None
+    and no vision tower is built or loaded."""
+
+    depth: int
+    hidden_size: int
+    intermediate_size: int
+    num_heads: int
+    patch_size: int
+    temporal_patch_size: int
+    spatial_merge_size: int
+    in_channels: int
+    num_position_embeddings: int
+    out_hidden_size: int
+    hidden_act: str
+
+
+def _parse_vision_config(hf_config: Any) -> Qwen4ExpVisionArgs | None:
+    vc = getattr(hf_config, "vision_config", None)
+    if vc is None or not vision_load_enabled():
+        # Vision is opt-in (default OFF), same contract as gemma4: the ViT is ~0.7 GiB of
+        # never-quantized bf16 that text-only serving never touches.
+        return None
+    get = lambda k, d=None: vc.get(k, d) if isinstance(vc, dict) else getattr(vc, k, d)
+    return Qwen4ExpVisionArgs(
+        depth=int(get("depth")),
+        hidden_size=int(get("hidden_size")),
+        intermediate_size=int(get("intermediate_size")),
+        num_heads=int(get("num_heads")),
+        patch_size=int(get("patch_size")),
+        temporal_patch_size=int(get("temporal_patch_size")),
+        spatial_merge_size=int(get("spatial_merge_size")),
+        in_channels=int(get("in_channels", 3)),
+        num_position_embeddings=int(get("num_position_embeddings")),
+        out_hidden_size=int(get("out_hidden_size")),
+        hidden_act=str(get("hidden_act", "gelu_pytorch_tanh")),
+    )
 
 
 def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
@@ -251,6 +296,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_head_dim=int(text.indexer_head_dim),
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
+        mrope_section=(
+            tuple(int(s) for s in rope_params["mrope_section"])
+            if rope_params.get("mrope_section")
+            else None
+        ),
     )
 
     return ModelConfig(
@@ -278,7 +328,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen4_exp"),
         architectures=getattr(hf_config, "architectures", ["Qwen4ExpForConditionalGeneration"]),
-        vision_config=None,  # served text-only
+        vision_config=_parse_vision_config(hf_config),
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
@@ -290,4 +340,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["PLE_CONV_STATE", "PLE_NGRAM_STATE", "Qwen4ExpArgs", "parse_config", "ple_slot_states"]
+__all__ = [
+    "PLE_CONV_STATE",
+    "PLE_NGRAM_STATE",
+    "Qwen4ExpArgs",
+    "Qwen4ExpVisionArgs",
+    "parse_config",
+    "ple_slot_states",
+]

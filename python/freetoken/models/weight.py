@@ -254,6 +254,12 @@ def load_weight(
         include_moe_experts=include_moe_experts,
         include_non_moe=True,
     )
+    # Optional model-specific vision tower (qwen4_exp's model.visual.*): a separate reader,
+    # chained only when the parsed config actually built the tower (vision load is opt-in).
+    if _config.is_multimodal:
+        iter_visual = _model_override(spec, "iter_visual_weights")
+        if iter_visual is not None:
+            yield from iter_visual(model_path, device)
 
 
 def load_moe_expert_sources(
@@ -379,7 +385,12 @@ def dummy_nvfp4_expert_sources(config) -> dict[str, list[torch.Tensor]]:
     reach 448 (and include NaN encodings), which would blow up the dummy activations.
     """
     num_layers = _num_moe_layers(config)
-    E = config.num_experts
+    # Expert-parallel TP: dummy banks mirror the real loader's per-rank shard (experts
+    # id % tp == rank at local row id // tp; see nvfp4_banks' expert_shard), so a
+    # dummy-weight TP boot exercises the same shapes the real load produces.
+    tp_size = get_tp_info().size
+    assert config.num_experts % tp_size == 0
+    E = config.num_experts // tp_size
     H, I = config.hidden_size, config.moe_intermediate_size
     fp8 = torch.float8_e4m3fn
 

@@ -99,14 +99,36 @@ class Qwen4ExpModel(BaseOP):
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
+        self._image_token_id = config.image_token_id
+        if config.vision_config is not None:
+            from .vision import Qwen4ExpVisionModel
+
+            self.visual = Qwen4ExpVisionModel(config.vision_config)
 
     @property
     def ple_layers(self) -> List[PLELayer]:
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
+    def _merge_multimodal(self, input_ids: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Scatter precomputed image soft tokens at ``image_token_id`` positions (same
+        contract as gemma4's): ``batch.mm_embeds`` is ``[num_image_tokens, hidden]`` in
+        request order; only prefill batches carrying images set it."""
+        batch = get_global_ctx().batch
+        mm_embeds = getattr(batch, "mm_embeds", None)
+        if mm_embeds is None or self._image_token_id is None:
+            return x
+        mask = input_ids == self._image_token_id
+        n_slots = int(mask.sum().item())
+        assert n_slots == mm_embeds.shape[0], (
+            f"image-token slots ({n_slots}) != vision features ({mm_embeds.shape[0]}); "
+            "image tokens must not be split across prefill chunks"
+        )
+        return x.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(x.dtype))
+
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        hidden = self._merge_multimodal(input_ids, self.embed_tokens.forward(input_ids))
+        hidden = hidden.repeat(1, self.hc_count)
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -178,6 +200,19 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 PinnedUVATable(table.bank.tensor, float(table.weight_scale))
             )
         return table.bank.nbytes
+
+    @torch.inference_mode()
+    def encode_images(
+        self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        """Run the vision tower: pixels -> ``[num_image_tokens, hidden]`` soft tokens.
+        Only available when the model was built with its vision tower (FREETOKEN_LOAD_VISION=1)."""
+        visual = getattr(self.model, "visual", None)
+        if visual is None:
+            raise RuntimeError(
+                "this checkpoint's vision tower was not loaded (set FREETOKEN_LOAD_VISION=1)"
+            )
+        return visual.forward(pixel_values, image_grid_thw)
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch

@@ -260,6 +260,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--rope-scaling",
+        dest="rope_scaling_override",
+        type=str,
+        default=ServerArgs.rope_scaling_override,
+        help=(
+            "JSON rope_scaling override applied to the model's rotary config, e.g. "
+            "'{\"rope_type\":\"yarn\",\"factor\":4.0,"
+            "\"original_max_position_embeddings\":262144}'. Combine with "
+            "--max-seq-len-override to serve past the checkpoint's context length."
+        ),
+    )
+
+    parser.add_argument(
         "--max-output-tokens",
         type=_positive_int,
         default=ServerArgs.max_output_tokens,

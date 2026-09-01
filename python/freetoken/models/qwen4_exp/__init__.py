@@ -1,4 +1,6 @@
-"""Qwen3.8-Flash-Next (model_type qwen4_exp), served text-only.
+"""Qwen3.8-Flash-Next (model_type qwen4_exp). Text-only by default; set
+``FREETOKEN_LOAD_VISION=1`` to also build/load the ``model.visual.*`` ViT and serve
+image inputs (see vision.py and mrope.py).
 
 48 decoder layers on hc_count=4 hyper-connection residual streams R [T, 4*hidden]:
 embed -> repeat(1, 4) -> [PLE at zero-based layer 1] -> per layer attn_hc.mix -> (GDN | QSA) -> attn_hc.combine -> mlp_hc.mix -> MoE -> mlp_hc.combine -> top-level mixer.mix -> lm_head.
@@ -12,6 +14,7 @@ Contracts shared across modules (do not rename):
 from .config import parse_config
 from .model import Qwen4ExpForCausalLM
 from .weight import (
+    iter_visual_weights,
     iter_weights,
     load_nvfp4_expert_sources,
     load_nvfp4_expert_sources_parallel,
@@ -26,6 +29,7 @@ from freetoken.models.qwen3_5_moe.weight import setup_offload_expert_banks
 
 __all__ = [
     "Qwen4ExpForCausalLM",
+    "iter_visual_weights",
     "iter_weights",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",

@@ -23,6 +23,15 @@ import pytest
 import torch
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _tp_info():
+    """dummy_nvfp4_expert_sources shards by the TP info (TP branch); default to tp=1."""
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
 # vllm (marlin W4A16 path) is intentionally not co-installable with the core transformers
 # pin; it lives in a dedicated venv. Skip rather than fail.
 marlin = pytest.mark.skipif(

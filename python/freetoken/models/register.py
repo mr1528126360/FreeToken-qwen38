@@ -59,7 +59,8 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen3_5MoEForCausalLM",
     ),
     # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
-    # text_config, weights under model.language_model.); served text-only. 36 GDN + 12 QSA
+    # text_config, weights under model.language_model.); the vision tower (model.visual.*)
+    # is opt-in via FREETOKEN_LOAD_VISION=1. 36 GDN + 12 QSA
     # compressed-sparse attention layers on 4 hyper-connection residual streams, a PLE
     # n-gram embedding layer, 512 NVFP4 routed experts top-10 + a gated shared expert.
     "Qwen4ExpForConditionalGeneration": ModelSpec(

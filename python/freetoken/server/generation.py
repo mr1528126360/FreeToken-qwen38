@@ -188,9 +188,10 @@ def resolve_sampling(
 
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize OpenAI-shaped message dicts for the chat template: flatten text
-    content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
+    """Normalize OpenAI-shaped message dicts for the chat template: flatten text-only
+    content parts to a string, pass image parts through for vision models, and decode
+    tool-call arguments from JSON. Raises ValueError on an unsupported content part.
+    Shared by all adapters."""
     return [_render_message(m) for m in messages]
 
 
@@ -198,7 +199,7 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     m = dict(message)
     content = m.get("content")
     if isinstance(content, list):
-        m["content"] = _flatten_text_parts(content)
+        m["content"] = _render_content_parts(content)
     # Templates read different reasoning keys (reasoning_content: most; reasoning:
     # gemma4; thinking: gpt-oss) — accept any, emit both.
     reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
@@ -239,6 +240,32 @@ def _flatten_text_parts(parts: list[Any]) -> str:
         else:
             raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
     return "".join(texts)
+
+
+def _render_content_parts(parts: list[Any]) -> str | list[dict[str, Any]]:
+    """Normalize an OpenAI content-part list for the chat template.
+
+    All-text lists flatten to a plain string (the historical text-only behavior — some
+    templates only accept string content). A list carrying ``image_url`` parts stays a list
+    of ``{"type", "text"}`` / ``{"type", "image_url"}`` dicts, which vision chat templates
+    (qwen4_exp's) render as ``<|vision_start|><|image_pad|><|vision_end|>`` placeholders;
+    the tokenizer worker decodes and preprocesses the referenced images. On a text-only
+    model the failure surfaces there, as a per-request encode error.
+    """
+    if all(isinstance(p, dict) and p.get("type") == "text" for p in parts):
+        return _flatten_text_parts(parts)
+    rendered: list[dict[str, Any]] = []
+    for part in parts:
+        ptype = part.get("type") if isinstance(part, dict) else None
+        if ptype == "text":
+            rendered.append(
+                {"type": "text", "text": (part.get("text") if isinstance(part, dict) else None) or ""}
+            )
+        elif ptype == "image_url" and isinstance(part, dict) and part.get("image_url"):
+            rendered.append({"type": "image_url", "image_url": part["image_url"]})
+        else:
+            raise ValueError(f"Unsupported content part type: {ptype}")
+    return rendered
 
 
 def split_tool_lists(

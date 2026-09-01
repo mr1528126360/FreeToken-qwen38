@@ -248,3 +248,61 @@ def test_two_qsa_layers_keep_separate_slab_slots(monkeypatch):
 
     slab = fixture.pool.cmp_k_cache
     assert not torch.equal(slab(0), slab(1))
+
+
+@requires_cuda
+def test_rope_positions_redirect_matches_the_plain_path():
+    """mRoPE plumbing regression: batch.rope_positions set (== positions) takes the redirect
+    path and must produce identical outputs, with k reaching the backend as a contiguous 2D
+    [T, num_kv*head_dim] tensor (the first version left k 3D and crashed the KV store)."""
+    config = parsed_config()
+    k_shapes = []
+
+    class SpyBackend:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def qsa_forward(self, q, k, v, index, layer_id, batch):
+            k_shapes.append((tuple(k.shape), k.is_contiguous()))
+            return self._inner.qsa_forward(q, k, v, index, layer_id, batch)
+
+    fixture = Fixture(config, num_pages=128)
+    attn = fixture.layer(QSA_LAYER)
+    lengths, steps = [300, 411, 64], 3
+    inputs = _inputs(fixture, lengths, extra=steps)
+    reqs = [fixture.req(i, 0, n) for i, n in enumerate(lengths)]
+
+    steps_x = [torch.cat([row[:n] for row, n in zip(inputs, lengths)])]
+    steps_x += [
+        torch.stack([row[n + s] for row, n in zip(inputs, lengths)]) for s in range(steps)
+    ]
+    # Plain run (no redirect), recording k shapes.
+    plain_outs = []
+    for step, x in enumerate(steps_x):
+        if step:
+            for req in reqs:
+                fixture.step(req)
+        plain_outs.append(attn.forward(x, fixture.batch(reqs, "prefill" if step == 0 else "decode")))
+
+    # Redirect run: identical math, but rope goes through rope_positions explicitly.
+    fixture2 = Fixture(config, num_pages=128)
+    attn2 = fixture2.layer(QSA_LAYER)
+    attn2.load_state_dict(attn.state_dict())
+    fixture2.ctx.attn_backend = SpyBackend(fixture2.backend)
+    reqs2 = [fixture2.req(i, 0, n) for i, n in enumerate(lengths)]
+    for step, x in enumerate(steps_x):
+        if step:
+            for req in reqs2:
+                fixture2.step(req)
+        batch = fixture2.batch(reqs2, "prefill" if step == 0 else "decode")
+        batch.rope_positions = batch.positions.clone()
+        batch.mrope_cos_sin = None
+        redirected = attn2.forward(x, batch)
+        assert torch.equal(plain_outs[step], redirected), f"step {step}: redirect diverged"
+
+    assert k_shapes, "backend never saw the redirected forward"
+    for shape, contig in k_shapes:
+        assert len(shape) == 2 and contig, f"k reached the backend as {shape} contig={contig}"

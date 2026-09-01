@@ -88,6 +88,11 @@ class QSASparseMetadata(BaseAttnMetadata):
     cmp_rows:         torch.Tensor | None = None  # [T] int32, compressed slab destination
     ring_rows:        torch.Tensor | None = None  # [T] int32, flat ring row or -1
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
+    # mRoPE redirect (qwen4_exp image batches; see models/qwen4_exp/mrope.py). rope_positions
+    # is the rope-lookup key per row (== positions for text-only batches, where both stay
+    # None); rope_table is the prefill per-token cos/sin table (None -> the standard cache).
+    rope_positions:   torch.Tensor | None = None
+    rope_table:       torch.Tensor | None = None
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -296,6 +301,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
         (it is layer-invariant). Pure device arithmetic: no host sync, graph-capturable."""
         md.positions = batch.positions
+        md.rope_positions = getattr(batch, "rope_positions", None)
+        md.rope_table = getattr(batch, "mrope_cos_sin", None)
         out_loc = batch.out_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
         rows = torch.arange(out_loc.numel(), device=self.device)
@@ -338,10 +345,17 @@ class QSASparseAttnBackend(BaseAttnBackend):
             pooled,
             first,
         )
+        # mRoPE: rope keys, not logical positions. The group-first token belongs to the same
+        # request as the closing row, so the per-row (rope_positions - positions) shift
+        # carries over: prefill it is the request's table offset, decode the rope delta.
+        rope_positions = md.rope_positions
+        table = md.rope_table if md.rope_table is not None else self._index_rope_cache()
+        if rope_positions is not None:
+            first = first + (rope_positions - md.positions)
         qsa_index_norm_rope(
             pooled,
             first,
-            self._index_rope_cache(),
+            table,
             index.k_norm_weight,
             index.eps,
             self.kvcache.cmp_k_cache(slot),
@@ -364,10 +378,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
         q_index = self._scratch(
             "q_index", rows, self.index_heads, self.index_head_dim, dtype=self.dtype
         )
+        # mRoPE: the query rope reads the redirect keys/table when the scheduler set them;
+        # visibility and block expansion below keep the logical positions.
         qsa_index_norm_rope(
             index.q.view(-1, self.index_head_dim),
-            positions,
-            self._index_rope_cache(),
+            md.rope_positions if md.rope_positions is not None else positions,
+            md.rope_table if md.rope_table is not None else self._index_rope_cache(),
             index.q_norm_weight,
             index.eps,
             q_index.view(-1, self.index_head_dim),

@@ -1,12 +1,13 @@
 """Qwen3.8-Flash-Next (RadixArk NVFP4) checkpoint reader.
 
-Three separate paths, because the checkpoint's three weight classes live in different places:
+Four separate paths, because the checkpoint's weight classes live in different places:
 
 * :func:`iter_weights` -- every dense (non-expert) tensor, with the ``model.language_model.`` prefix stripped and fused where the model expects one buffer. See ``_FUSIONS``.
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
+* :func:`iter_visual_weights` -- the ``model.visual.*`` ViT weights (bf16, replicated), only when vision loading is enabled (``FREETOKEN_LOAD_VISION=1``).
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
+Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``). ``model.visual.*`` is dropped from the dense path and loaded by :func:`iter_visual_weights` instead.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from freetoken.models.nvfp4_banks import (
     load_nvfp4_expert_source_banks,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import download_hf_weight
+from freetoken.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
 
@@ -137,6 +138,79 @@ def _try_fuse(
     return None
 
 
+# ======================================================================================
+# TP sharding of the dense (non-expert) weights
+# ======================================================================================
+#
+# Applied to the FUSED tensors (qkv_proj / in_proj / gate_up_proj), i.e. after ``_try_fuse``:
+# the fusions concatenate along dim 0, and the per-segment shard below cuts the same rows the
+# per-part shard would, so the two orders are equivalent. Everything not listed here
+# (HC mixers, norms, PLE, the QSA indexer, the MoE router gate) is replicated: the residual
+# streams R are identical on every rank because each block's output is all-reduced.
+
+
+def _head_rows(t: torch.Tensor, offset: int, width: int, rank: int, size: int) -> torch.Tensor:
+    """This rank's row range of a head-major block starting at ``offset`` (width % size == 0)."""
+    local = width // size
+    return t[offset + rank * local : offset + (rank + 1) * local]
+
+
+def _shard_dense_weight(name: str, tensor: torch.Tensor, *, rank: int, size: int, config) -> torch.Tensor:
+    """TP shard of one fused dense weight; identity at size 1 (never called then)."""
+    if name.endswith(".self_attn.qkv_proj.weight"):
+        # [2*qo | kv | kv] rows; q is 2x wide (carries the gate) and every segment is
+        # head-divisible, so a per-segment dim-0 chunk stays head-aligned.
+        qo = config.num_qo_heads * config.head_dim
+        kv = config.num_kv_heads * config.head_dim
+        segs = tensor.split([2 * qo, kv, kv], dim=0)
+        return torch.cat([seg.chunk(size, dim=0)[rank] for seg in segs], dim=0)
+    if name.endswith(".self_attn.o_proj.weight"):
+        return tensor.chunk(size, dim=1)[rank]
+    if name.endswith(".linear_attn.in_proj.weight"):
+        # [qkv_conv | z | b | a], with the conv segment itself [q | k | v]; shard every
+        # head-major block separately so the local layout is [q_r | k_r | v_r | z_r | b_r | a_r].
+        group = config.linear_attention_group()
+        key = group.num_key_heads * group.key_head_dim
+        value = group.num_value_heads * group.value_head_dim
+        conv = 2 * key + value
+        rows = [
+            _head_rows(tensor, 0, key, rank, size),
+            _head_rows(tensor, key, key, rank, size),
+            _head_rows(tensor, 2 * key, value, rank, size),
+            _head_rows(tensor, conv, value, rank, size),  # z
+            _head_rows(tensor, conv + value, group.num_value_heads, rank, size),  # b
+            _head_rows(tensor, conv + value + group.num_value_heads, group.num_value_heads, rank, size),  # a
+        ]
+        return torch.cat(rows, dim=0)
+    if name.endswith(".linear_attn.conv1d.weight"):
+        # [2*key | value] depthwise rows, same head-major split as the in_proj conv segment.
+        group = config.linear_attention_group()
+        key = group.num_key_heads * group.key_head_dim
+        value = group.num_value_heads * group.value_head_dim
+        rows = [
+            _head_rows(tensor, 0, key, rank, size),
+            _head_rows(tensor, key, key, rank, size),
+            _head_rows(tensor, 2 * key, value, rank, size),
+        ]
+        return torch.cat(rows, dim=0)
+    if name.endswith((".linear_attn.A_log", ".linear_attn.dt_bias")):
+        return tensor.chunk(size, dim=0)[rank]
+    if name.endswith(".linear_attn.out_proj.weight"):
+        return tensor.chunk(size, dim=1)[rank]
+    if name.endswith(".mlp.shared_expert.gate_up_proj.weight"):
+        half = tensor.shape[0] // 2
+        return torch.cat(
+            [tensor[:half].chunk(size, dim=0)[rank], tensor[half:].chunk(size, dim=0)[rank]],
+            dim=0,
+        )
+    if name.endswith(".mlp.shared_expert.down_proj.weight"):
+        return tensor.chunk(size, dim=1)[rank]
+    if name in ("model.embed_tokens.weight", "lm_head.weight"):
+        per_rank = div_ceil(tensor.shape[0], size)
+        return tensor[rank * per_rank : min((rank + 1) * per_rank, tensor.shape[0])]
+    return tensor
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -154,19 +228,31 @@ def iter_weights(
     gate|up -> ``gate_up_proj``, and each per-layer HC's ``input_mix_weight_down`` |
     ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
 
+    Under TP each fused tensor is sharded for this rank (see ``_shard_dense_weight``) after
+    fusion; the routed experts are sharded by expert id in ``load_nvfp4_expert_sources``.
+
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the
     routed experts are NVFP4 and always come from :func:`load_nvfp4_expert_sources`.
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
     if not include_non_moe:
         return
+    tp_info = get_tp_info()
+    config = None
+    if tp_info.size > 1:
+        from .config import parse_config
+
+        config = parse_config(cached_load_hf_config(model_path))
+
+    def shard(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if tp_info.size == 1:
+            return tensor
+        return _shard_dense_weight(name, tensor, rank=tp_info.rank, size=tp_info.size, config=config)
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
-        disable=not get_tp_info().is_primary(),
+        disable=not tp_info.is_primary(),
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
@@ -177,11 +263,47 @@ def iter_weights(
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
-                        yield fused
+                        yield fused[0], shard(*fused)
                     continue
-                yield name, tensor
+                yield name, shard(name, tensor)
 
     assert not fuse_buf, f"Incomplete projection fusions: {sorted(fuse_buf)}"
+
+
+# ======================================================================================
+# Vision tower (model.visual.*), opt-in via FREETOKEN_LOAD_VISION=1
+# ======================================================================================
+#
+# Separate from ``iter_weights`` on purpose: the tower is bf16, replicated on every TP rank
+# (no sharding, no fusion), and only exists in the model's state dict when vision loading is
+# enabled. ``_rename`` still drops these keys from the dense path unconditionally.
+
+_VISUAL_RENAMES = {
+    "model.visual.patch_embed.proj.weight": "model.visual.patch_embed.proj_weight",
+    "model.visual.patch_embed.proj.bias": "model.visual.patch_embed.proj_bias",
+    # nn.Embedding.weight -> the plain pos_embed tensor on Qwen4ExpVisionModel.
+    "model.visual.pos_embed.weight": "model.visual.pos_embed",
+}
+
+
+def iter_visual_weights(
+    model_path: str, device: torch.device
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield the vision tower's weights with FreeToken state-dict names (all replicated)."""
+    from freetoken.models.config import vision_load_enabled
+
+    if not vision_load_enabled():
+        return
+    for file in tqdm(
+        iter_weight_files(model_path),
+        desc="Loading vision weights",
+        disable=not get_tp_info().is_primary(),
+    ):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                if not raw_name.startswith("model.visual."):
+                    continue
+                yield _VISUAL_RENAMES.get(raw_name, raw_name), f.get_tensor(raw_name)
 
 
 # ======================================================================================
@@ -289,6 +411,12 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
 # ======================================================================================
 
 
+def _expert_shard() -> tuple[int, int] | None:
+    """This rank's expert-parallel shard (experts ``id % size == rank``), None at TP=1."""
+    tp_info = get_tp_info()
+    return (tp_info.rank, tp_info.size) if tp_info.size > 1 else None
+
+
 def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None) -> dict:
     """Build the CPU NVFP4 expert source banks for the offload cache (gate/up fused on the output-row axis, down separate; weight_scale_2 carried as the per-row global scale)."""
     return load_nvfp4_expert_source_banks(
@@ -298,6 +426,7 @@ def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None) -> di
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         layer_sink=layer_sink,
+        expert_shard=_expert_shard(),
     )
 
 
@@ -316,11 +445,13 @@ def load_nvfp4_expert_sources_parallel(
         workers=workers,
         chunk=chunk,
         layer_sink=layer_sink,
+        expert_shard=_expert_shard(),
     )
 
 
 __all__ = [
     "PleTable",
+    "iter_visual_weights",
     "iter_weights",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",

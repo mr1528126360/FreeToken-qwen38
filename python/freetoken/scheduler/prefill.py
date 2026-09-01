@@ -7,7 +7,7 @@ import torch
 from freetoken.core import Batch, Req
 from freetoken.utils import align_down, div_ceil, init_logger
 
-from .utils import PendingReq
+from .utils import PendingReq, has_mm
 
 if TYPE_CHECKING:
     from freetoken.kvcache import BaseCacheHandle
@@ -171,7 +171,7 @@ class PrefillAdder:
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
-        if is_chunked and pending_req.mm_embeds is not None:
+        if is_chunked and has_mm(pending_req):
             raise NotImplementedError(
                 "Multimodal prompts must fit in a single prefill chunk; increase "
                 "--max-extend-tokens or shrink the prompt."
@@ -185,6 +185,7 @@ class PrefillAdder:
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
             mm_embeds=pending_req.mm_embeds,
+            mm_inputs=pending_req.mm_inputs,
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -245,7 +246,10 @@ class PrefillManager:
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
+            PendingReq(
+                req.uid, req.input_ids, req.sampling_params,
+                mm_embeds=req.mm_embeds, mm_inputs=req.mm_inputs,
+            )
         )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:

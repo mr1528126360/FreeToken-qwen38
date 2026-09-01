@@ -20,6 +20,34 @@ if TYPE_CHECKING:
 # generic softmax+top-k path.
 TopK = Tuple[torch.Tensor, torch.Tensor]
 
+
+def partition_topk_experts(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    rank: int,
+    size: int,
+) -> TopK:
+    """Expert-parallel routing split: each rank keeps the experts ``id % size == rank``.
+
+    The routing input is identical on every rank (the block outputs feeding the MoE are
+    all-reduced), so all ranks compute the same top-k and each computes only its own
+    experts; ``_maybe_all_reduce`` then reassembles the full sum. The [T, top_k] layout
+    is preserved (CUDA-graph shapes stay static): owned entries keep their (already
+    renormalized) weight and remap to the LOCAL bank row ``id // size``; non-owned
+    entries get weight 0 and id -1.
+
+    The -1 sentinel is honoured directly by the CPU executor (its kernel skips id < 0).
+    The GPU slot-cache kernels cannot index by -1, so the GPU branches clamp it to the
+    dump row 0 first: row 0 is an owned expert that ensure_experts therefore keeps
+    resident, and the zeroed weight kills its (finite) contribution. With size == 1 this
+    function is the identity and is never called.
+    """
+    owned = topk_ids.remainder(size) == rank
+    weights = torch.where(owned, topk_weights, 0.0)
+    ids = torch.where(owned, topk_ids // size, -1)
+    return weights, ids
+
 # Hybrid decode overlaps the CPU overflow GEMV behind the GPU PCIe fetch + GEMM by
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
@@ -49,6 +77,7 @@ class MoELayer(BaseOP):
 
         tp_info = get_tp_info()
         self.tp_size = tp_size = tp_info.size
+        self.tp_rank = tp_info.rank
         self.renormalize = renormalize
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -66,6 +95,10 @@ class MoELayer(BaseOP):
         if self.weight_format == "fp8_block":
             # Stacked block-fp8 experts + bf16 per-128x128-block inverse scales.
             # Full (unpartitioned) intermediate size: this layout is TP=1-only.
+            assert self.tp_size == 1, (
+                "resident block-fp8 experts are full-width (TP=1 only); "
+                "use an offload MoE backend for TP"
+            )
             from freetoken.kernel.triton.fp8_block_linear import FP8
 
             blk = 128
@@ -218,6 +251,26 @@ class OffloadMoELayer(MoELayer):
         )
         self.layer_id = layer_id
         self.offload_cache: OffloadMoeCache | None = None
+        # Expert-parallel TP: the offload backends stream experts from per-rank host
+        # banks, so instead of intermediate-sharding every expert (the resident MoELayer
+        # scheme) each rank owns the experts ``id % tp_size == rank`` outright and the
+        # routing is partitioned onto local ids by ``partition_topk_experts``. The cache
+        # is built with this same local count (engine._local_num_experts).
+        self.num_experts_global = num_experts
+        if self.tp_size > 1:
+            assert num_experts % self.tp_size == 0, (
+                f"offload MoE expert-parallel TP needs num_experts % tp_size == 0, "
+                f"got {num_experts} experts on {self.tp_size} ranks"
+            )
+            self.num_experts = num_experts // self.tp_size
+
+    def _partition_topk(self, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> TopK:
+        """TP identity at size 1; else keep only this rank's experts (see partition_topk_experts)."""
+        if self.tp_size == 1:
+            return topk_weights, topk_ids
+        return partition_topk_experts(
+            topk_weights, topk_ids, rank=self.tp_rank, size=self.tp_size
+        )
 
     def forward(
         self,
@@ -300,15 +353,24 @@ class OffloadMoELayer(MoELayer):
         (high RAM bandwidth) straight from the host banks: ship hidden/routing to
         pinned host memory, run the GEMV on the worker pool via host nodes, ship the
         result back. The GPU slot cache is untouched (topk_ids keep their raw expert
-        ids), so no ``ensure_experts``/``copy_missing`` here."""
+        ids), so no ``ensure_experts``/``copy_missing`` here.
+
+        Under TP the routing is partitioned first: ``topk_ids`` holds LOCAL expert ids
+        with -1 on non-owned entries (weight already 0). The CPU executor skips the -1
+        routes outright; the GPU paths clamp them onto dump row 0 (an owned expert whose
+        slot is then guaranteed resident), so the slot kernels never see a negative id
+        and no non-owned expert ever crosses PCIe."""
         cache = self.offload_cache
         assert cache is not None
+        topk_weights, topk_ids = self._partition_topk(topk_weights, topk_ids)
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        if self.tp_size > 1:
+            topk_ids = topk_ids.clamp_min(0)  # -1 (not mine) -> dump row 0, weight 0
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(
@@ -340,13 +402,23 @@ class OffloadMoELayer(MoELayer):
         """
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
-        raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
+        # Under expert-parallel TP ``topk_ids`` holds local ids with -1 on non-owned
+        # entries; those must never reach the CPU side as a fetchable id, so the CPU
+        # partial keeps the -1 (the C++ kernel skips it) while the GPU side clamps to
+        # dump row 0 before the ensure kernel runs.
+        cpu_raw = topk_ids
+        if self.tp_size > 1:
+            topk_ids = topk_ids.clamp_min(0)  # -1 (not mine) -> dump row 0, weight 0
+            cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot or -1
+        else:
+            raw = topk_ids.clone()  # raw expert ids for the CPU partial
+            cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
+            cpu_raw = raw
         if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)
         on_gpu = topk_ids >= 0
 
-        cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
+        cpu_ids = torch.where(on_gpu, cpu_raw.new_full((), -1), cpu_raw).contiguous()
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
@@ -380,9 +452,14 @@ class OffloadMoELayer(MoELayer):
         """Prefill movement: stream whole layers -- double-buffered behind the
         previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
         ``materialize_layer``. In both, position == expert id, so the routing ids
-        pass through unmapped."""
+        pass through unmapped. Under TP the stream covers this rank's local experts
+        only, and the partitioned routing's -1 entries (weight 0) clamp onto the
+        materialized dump row 0."""
         cache = self.offload_cache
         assert cache is not None
+        topk_weights, topk_ids = self._partition_topk(topk_weights, topk_ids)
+        if self.tp_size > 1:
+            topk_ids = topk_ids.clamp_min(0)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
