@@ -61,7 +61,7 @@ done
 
 ## 服务地址
 
-- 本机 `http://127.0.0.1:1919`，局域网 `http://10.38.6.56:1919`
+- 本机 `http://127.0.0.1:1919`，局域网 `http://<服务器IP>:1919`
 - OpenAI 兼容 `/v1/chat/completions`、`/v1/models`；Anthropic `/v1/messages`
 - 无鉴权，勿暴露公网。
 

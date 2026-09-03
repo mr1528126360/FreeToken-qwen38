@@ -268,7 +268,7 @@ nvidia-smi --query-compute-apps=pid --format=csv,noheader | while read p; do kil
 ## 6. 客户端配置
 
 - 本机地址：`http://127.0.0.1:1919`
-- 局域网地址示例：`http://10.38.6.53:1919`（以实际 IP 为准）
+- 局域网地址示例：`http://<服务器IP>:1919`（以实际 IP 为准）
 - OpenAI 兼容接口：`POST /v1/chat/completions`、`/v1/models`
 - Anthropic 兼容接口：`/v1/messages`
 - **无鉴权，勿暴露公网**

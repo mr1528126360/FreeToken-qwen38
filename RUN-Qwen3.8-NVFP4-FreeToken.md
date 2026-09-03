@@ -110,7 +110,7 @@ nohup .venv/bin/ft serve --model ~/models/Qwen3.8-Flash-Next-NVFP4 \
 
 ## 4. 服务地址与客户端配置
 
-- 本机 `http://127.0.0.1:1919`，局域网 **`http://10.38.6.53:1919`**
+- 本机 `http://127.0.0.1:1919`，局域网 **`http://<服务器IP>:1919`**
 - OpenAI 兼容 `POST /v1/chat/completions`、`/v1/models`；Anthropic `/v1/messages`
 - **无鉴权，勿暴露公网**
 
@@ -118,14 +118,14 @@ Trae / OpenAI 兼容客户端配置三项：
 
 | 配置项 | 值 |
 |---|---|
-| API 地址 / Base URL | `http://10.38.6.53:1919/v1` |
+| API 地址 / Base URL | `http://<服务器IP>:1919/v1` |
 | API Key | 任意非空字符串，如 `sk-local` |
 | 模型 ID | `Qwen3.8-Flash-Next-NVFP4` |
 
 curl 验证：
 
 ```bash
-curl http://10.38.6.53:1919/v1/chat/completions -H "Content-Type: application/json" \
+curl http://<服务器IP>:1919/v1/chat/completions -H "Content-Type: application/json" \
   -d '{"model":"Qwen3.8-Flash-Next-NVFP4","messages":[{"role":"user","content":"你好"}],"max_tokens":256}'
 ```
 

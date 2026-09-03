@@ -109,7 +109,7 @@ nohup .venv/bin/ft serve --model ~/models/Qwen3.8-Flash-Next-NVFP4 \
 
 ### 共用说明
 
-- 服务地址：本机 `http://127.0.0.1:1919`，局域网 `http://10.38.6.56:1919`
+- 服务地址：本机 `http://127.0.0.1:1919`，局域网 `http://<服务器IP>:1919`
   （OpenAI `/v1/chat/completions`、Anthropic `/v1/messages` 兼容，无鉴权勿暴露公网）
 - **Qwen 与 DeepSeek-V4-Flash 不能同时运行**（内存合计超 247GB，会被 OOM 双杀）
 
