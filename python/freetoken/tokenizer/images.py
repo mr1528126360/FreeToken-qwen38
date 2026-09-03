@@ -1,8 +1,8 @@
 """Multimodal (image) intake for the tokenizer worker.
 
 Parses OpenAI-style ``image_url`` content parts (base64 data URLs and http(s)), runs the
-checkpoint's image processor (the PIL backend of Qwen2VL -- the qwen4_exp preprocessor
-config), and packs the result into a serializable payload that rides ``UserMsg.mm_inputs``
+checkpoint's image processor (picked per ``model_type``, see ``ImageProcessor._PROCESSORS``),
+and packs the result into a serializable payload that rides ``UserMsg.mm_inputs``
 to the scheduler, which runs the vision tower on it.
 
 Token layout: the chat template renders one ``<|vision_start|><|image_pad|><|vision_end|>``
@@ -13,6 +13,7 @@ soft-token count (``prod(grid_thw) // merge_size**2``), matching HF's processor 
 from __future__ import annotations
 
 import base64
+import importlib
 import io
 import json
 import os
@@ -77,25 +78,41 @@ def decode_images(urls: list[str]):
 class ImageProcessor:
     """Lazy wrapper over the checkpoint's image processor + image-token metadata."""
 
+    # model_type -> (module path, class name) of the PIL image processor. The PIL backend needs
+    # no torchvision and matches the shipped processor config.
+    _PROCESSORS = {
+        "glm5_next": (
+            "transformers.models.glm5_next.image_processing_pil_glm5_next",
+            "Glm5NextImageProcessorPil",
+        ),
+        "qwen4_exp": (
+            "transformers.models.qwen2_vl.image_processing_pil_qwen2_vl",
+            "Qwen2VLImageProcessorPil",
+        ),
+    }
+    _DEFAULT_PROCESSOR = (
+        "transformers.models.qwen2_vl.image_processing_pil_qwen2_vl",
+        "Qwen2VLImageProcessorPil",
+    )
+
     def __init__(self, model_path: str):
         self._model_path = model_path
         self._processor = None
         self._unavailable = False
         self.image_token_id: int | None = None
+        self._model_type: str | None = None
         try:
             with open(os.path.join(model_path, "config.json"), encoding="utf-8") as fh:
-                self.image_token_id = json.load(fh).get("image_token_id")
+                cfg = json.load(fh)
+            self.image_token_id = cfg.get("image_token_id")
+            self._model_type = cfg.get("model_type")
         except OSError:
             pass
 
     def _load(self):
-        # The PIL backend needs no torchvision and matches the shipped preprocessor_config
-        # (Qwen2VLImageProcessorFast declares the same resize/normalize parameters).
-        from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import (
-            Qwen2VLImageProcessorPil,
-        )
-
-        return Qwen2VLImageProcessorPil.from_pretrained(self._model_path)
+        module, cls = self._PROCESSORS.get(self._model_type, self._DEFAULT_PROCESSOR)
+        processor = getattr(importlib.import_module(module), cls)
+        return processor.from_pretrained(self._model_path)
 
     @property
     def available(self) -> bool:

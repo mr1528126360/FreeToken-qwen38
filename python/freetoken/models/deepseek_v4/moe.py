@@ -94,9 +94,9 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        # Whole-layer streaming moves all num_experts rows per layer; a small
-        # chunk touches at most T*top_k of them, so below that crossover the
-        # decode-style on-demand slot path strictly moves fewer bytes (and
+        # Whole-layer streaming moves all (local) num_experts rows per layer; a small
+        # chunk touches at most T*top_k of the GLOBAL experts, so below that crossover
+        # the decode-style on-demand slot path strictly moves fewer bytes (and
         # keeps short-prompt slot residency -- hence hybrid decode's GPU/CPU
         # route split -- unchanged). Mixing modes across chunks is safe: the
         # streaming buffers disown their borrowed slots on invalidation.
@@ -104,10 +104,17 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         assert cache is not None
         # unpinned (LOCKED) layers must take the base materialize path: their copy_missing is the whole-layer pageable branch with position == expert id, which ensure_experts's LRU slot remap would contradict (the GEMM would gather other experts' weights)
         if (
-            hidden_states.shape[0] * self.top_k >= self.num_experts
+            hidden_states.shape[0] * self.top_k >= self.num_experts_global
             or cache.is_unpinned_layer(self.layer_id)
         ):
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
+        if self.tp_size > 1:
+            # Expert-parallel TP: keep only this rank's experts (remapped to local
+            # bank rows; non-owned get weight 0 / id -1), then clamp the -1 entries
+            # onto dump row 0 exactly like the base decode path. The exit all_reduce
+            # (routed_forward's _maybe_all_reduce) reassembles the full sum.
+            topk_weights, topk_ids = self._partition_topk(topk_weights, topk_ids)
+            topk_ids = topk_ids.clamp_min(0)  # -1 (not mine) -> dump row 0, weight 0
         cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
         cache.copy_missing()
         if cache.collect_stats:

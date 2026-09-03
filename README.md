@@ -24,8 +24,16 @@
 ## 2. 已验证环境与稳定性声明
 
 **特别说明：目前只有 Qwen3.8-Flash-Next（NVFP4 量化版）完成了充分测试，
-包括连续 12 小时长任务运行验证。** 其他模型（DeepSeek-V4-Flash、GLM、MiniMax 等）
-未在本分支上验证过，请按原版能力对待。
+包括连续 12 小时长任务运行验证。** GLM-5.3-Flash 与 DeepSeek-V4-Flash 的双卡 TP=2 已在环境 B（2×RTX 5880 Ada）验证通过，详见修订说明。其他模型（MiniMax 等）未在本分支上验证过，请按原版能力对待。
+
+## 修订说明
+
+| 日期 | 内容 |
+|---|---|
+| 2026-08 | Qwen3.8-Flash-Next：TP=2、1M 上下文（YaRN）、Qwen 图片理解、稳定性修复 |
+| 2026-09-01 | NCCL 跨 NUMA 死锁修复（双卡跨 NUMA 拓扑下强制 socket 传输：`NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 NCCL_NET=Socket`） |
+| 2026-09-03 | GLM-5.3-Flash 与 DeepSeek-V4-Flash 双卡 TP=2 支持（改动见 [改动文档-GLM与DSV4双卡TP.md](改动文档-GLM与DSV4双卡TP.md) |
+| 2026-09-03 | GLM-5.3-Flash 视觉模块（用户补充）：新增 24 块 ViT 视觉编码器（与 HF 参考实现逐位一致，BF16 maxdiff=0）+ 图片理解链路 |
 
 | 环境 | 配置 | 状态 |
 |---|---|---|

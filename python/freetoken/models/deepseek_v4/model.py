@@ -26,9 +26,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
+from freetoken.layers import ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.utils import torch_dtype
 
 from .args import DeepseekV4Args
 from .attention import Attention
@@ -134,11 +137,17 @@ class Transformer(nn.Module):
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps
         self.hc_mult = hc_mult = args.hc_mult
-        self.embed = nn.Embedding(args.vocab_size, args.dim)
-        self.embed.weight.requires_grad_(False)
+        # Vocab-parallel embedding / LM head (div_ceil contiguous rows per TP rank; the
+        # embedding all-reduces, the head's logits are all-gathered and trimmed). Both
+        # are BaseOPs (plain-tensor .weight), so state_dict/load_state_dict handle them
+        # explicitly below -- the keys ("embed.weight", "head") are unchanged.
+        self.embed = VocabParallelEmbedding(args.vocab_size, args.dim)
         self.layers = nn.ModuleList([Block(i, args) for i in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, self.norm_eps)
-        self.head = nn.Parameter(torch.empty(args.vocab_size, args.dim, dtype=torch.bfloat16), requires_grad=False)
+        # The head stays bf16 regardless of the ambient dtype (checkpoint dtype).
+        with torch_dtype(torch.bfloat16):
+            self.head = ParallelLMHead(args.vocab_size, args.dim)
+        self._comm = DistributedCommunicator()
         hc_dim = hc_mult * args.dim
         self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim, dtype=torch.float32), requires_grad=False)
         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32), requires_grad=False)
@@ -158,6 +167,26 @@ class Transformer(nn.Module):
         M = shape[0] * shape[1]
         return hc_pre_combine(xf.view(M, self.hc_mult, dim), pre.view(M, self.hc_mult), dtype).view(*shape[:2], dim)
 
+    def _embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # The indexing kernel behind VocabParallelEmbedding takes 1-D indices.
+        shape = input_ids.shape
+        return self.embed.forward(input_ids.reshape(-1)).view(*shape, self.args.dim)
+
+    def _head_logits(self, h_rows: torch.Tensor) -> torch.Tensor:
+        # h_rows: [B, dim] last-token rows (selected by the caller) -> [B, vocab].
+        logits = F.linear(h_rows, self.head.weight)  # [B, vocab_tp]
+        tp = self.head.tp_size
+        if tp == 1:
+            return logits
+        # all_gather concatenates along dim 0 in rank order; regroup to
+        # [B, tp * vocab_tp] and trim the div_ceil padding (ParallelLMHead.forward's
+        # reassembly; DSV4 selects the last-token rows itself, so its forward -- which
+        # re-derives them off ctx.batch -- is not used here).
+        gathered = self._comm.all_gather(logits)
+        B, vt = logits.shape
+        out = gathered.view(tp, B, vt).permute(1, 0, 2).reshape(B, tp * vt)
+        return out[:, : self.args.vocab_size]
+
     def prefill_batched(
         self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor,
         last_indices: torch.Tensor,
@@ -172,13 +201,13 @@ class Transformer(nn.Module):
         # metadata; ``flat_positions`` [T] is the scheduler-staged batch.positions (per-token
         # ABSOLUTE position); ``last_indices`` [B] is the flattened index of each request's
         # final token -> its next-token logits row.
-        h = self.embed(input_ids)
+        h = self._embed_tokens(input_ids)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.layers:
             h = layer.prefill_batched(h, input_ids, segments, flat_positions)
         h = self.hc_head(h)
         h = self.norm(h)
-        return F.linear(h[0, last_indices], self.head)  # [B, vocab]
+        return self._head_logits(h[0, last_indices])  # [B, vocab]
 
     def decode(
         self, input_ids: torch.Tensor, pos: torch.Tensor, cmp_stage_cap: int
@@ -194,7 +223,7 @@ class Transformer(nn.Module):
         # in-flight replay (it mutates only the live map).
         B = input_ids.size(0)
         rows = torch.arange(B, device=input_ids.device)
-        h = self.embed(input_ids)
+        h = self._embed_tokens(input_ids)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         # Hoist the layer-invariant per-step decode tensors (shared window-ring global slots):
         # resolved ONCE off the attention metadata (recomputed per call, so a capture records
@@ -206,7 +235,7 @@ class Transformer(nn.Module):
             h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
         h = self.hc_head(h)
         h = self.norm(h)
-        return F.linear(h[:, -1], self.head)
+        return self._head_logits(h[:, -1])
 
 
 class DeepseekV4ForCausalLM(BaseLLMModel):
@@ -244,10 +273,18 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         for block in self._transformer.layers:
             yield block.ffn.experts
 
+    def _vocab_weight_ops(self):
+        """The BaseOP-held vocab-parallel tensors (not nn.Parameters, so the nn.Module
+        state plumbing never sees them). Keys stay "embed.weight" / "head"."""
+        t = self._transformer
+        return (("embed.weight", t.embed), ("head", t.head))
+
     def state_dict(self, *, prefix: str = "", result=None):
         result = {} if result is None else result
         for name, p in self._transformer.named_parameters():
             result[f"{prefix}.{name}" if prefix else name] = p
+        for name, op in self._vocab_weight_ops():
+            result[f"{prefix}.{name}" if prefix else name] = op.weight
         return result
 
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
@@ -257,6 +294,16 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             if key not in state_dict:
                 raise RuntimeError(f"Missing weight for DeepSeek-V4 parameter: {key}")
             casted[name] = state_dict.pop(key).to(p.dtype)
+        for name, op in self._vocab_weight_ops():
+            key = f"{prefix}.{name}" if prefix else name
+            if key not in state_dict:
+                raise RuntimeError(f"Missing weight for DeepSeek-V4 parameter: {key}")
+            value = state_dict.pop(key).to(op.weight.dtype)
+            assert value.shape == op.weight.shape, (
+                f"DeepSeek-V4 parameter {key}: loaded {tuple(value.shape)}, "
+                f"expected {tuple(op.weight.shape)}"
+            )
+            op.weight = value
         if state_dict and not _internal:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
         self._transformer.load_state_dict(casted, assign=True, strict=False)

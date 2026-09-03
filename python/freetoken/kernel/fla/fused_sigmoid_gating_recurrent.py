@@ -3,7 +3,10 @@ decode kernel. Borrowed verbatim (pure torch+triton, no sglang deps) from sglang
 ``python/sglang/srt/layers/attention/fla/fused_sigmoid_gating_recurrent.py``.
 Does gating(sigmoid+softplus) + optional in-kernel l2norm + delta-rule recurrent update +
 per-request state read/write-by-index in ONE kernel — no external gating or
-gather/scatter/clone glue."""
+gather/scatter/clone glue.
+Local extension (off by default, so every existing caller is bit-identical): ``USE_RAW_G`` /
+``USE_RAW_BETA`` consume model-precomputed gates instead of deriving them from A_log/dt_bias —
+GLM-5.3-Flash's KDA forget gate is a bounded sigmoid, not a softplus."""
 from typing import Optional
 
 import torch
@@ -57,6 +60,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    # Raw-gate flags (default False -> legacy sigmoid+softplus gating, bit-identical)
+    USE_RAW_G: tl.constexpr = False,
+    USE_RAW_BETA: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -155,29 +161,40 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_b = tl.load(p_b).to(tl.float32)
 
-        # Compute sigmoid gating
-        # Load gating parameters
-        b_A_log = tl.load(p_A_log).to(tl.float32)
-        if IS_KDA:
-            b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
-            b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
+        # Gating: either consume `a` verbatim as the log-decrement (raw-g path, for models
+        # whose gate is computed outside the kernel, e.g. GLM-5.3-Flash's bounded-sigmoid
+        # forget gate) or apply the GDN formula g = -exp(A_log) * softplus(a + dt_bias).
+        if USE_RAW_G:
+            if IS_KDA:
+                b_g = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
+            else:
+                b_g = tl.load(p_a).to(tl.float32)
         else:
-            b_a = tl.load(p_a).to(tl.float32)
-            b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+            # Load gating parameters
+            b_A_log = tl.load(p_A_log).to(tl.float32)
+            if IS_KDA:
+                b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
+                b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
+            else:
+                b_a = tl.load(p_a).to(tl.float32)
+                b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
-        # Compute g = -exp(A_log) * softplus(a + dt_bias)
-        x = b_a + b_dt_bias
-        beta_x = softplus_beta * x
-        # Apply softplus with numerical stability
-        softplus_x = tl.where(
-            beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-            x,
-        )
-        b_g = -tl.exp(b_A_log) * softplus_x
+            # Compute g = -exp(A_log) * softplus(a + dt_bias)
+            x = b_a + b_dt_bias
+            beta_x = softplus_beta * x
+            # Apply softplus with numerical stability
+            softplus_x = tl.where(
+                beta_x <= softplus_threshold,
+                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+                x,
+            )
+            b_g = -tl.exp(b_A_log) * softplus_x
 
-        # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        # Compute beta = sigmoid(b) (skipped when the caller already applied sigmoid)
+        if USE_RAW_BETA:
+            b_beta = b_b
+        else:
+            b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
@@ -245,9 +262,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
 
 def fused_sigmoid_gating_delta_rule_update(
-    A_log: torch.Tensor,
+    A_log: Optional[torch.Tensor],
     a: torch.Tensor,
-    dt_bias: torch.Tensor,
+    dt_bias: Optional[torch.Tensor],
     softplus_beta: float,
     softplus_threshold: float,
     q: torch.Tensor,
@@ -268,6 +285,11 @@ def fused_sigmoid_gating_delta_rule_update(
         int
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    # Raw-gate path: ``a`` carries the log-decrement (and ``b`` the beta) verbatim, so the
+    # in-kernel softplus/A_log/dt_bias gating and the beta sigmoid are skipped. Both must be
+    # False for the GDN models that predate this switch (their behavior is bit-identical).
+    use_raw_g: bool = False,
+    use_raw_beta: bool = False,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -278,6 +300,10 @@ def fused_sigmoid_gating_delta_rule_update(
     - decode: standard single-step update with state write-back
     - target_verify: multi-step with intermediate state caching, optional tree attention,
                      and optional state update disable
+    - raw gates (``use_raw_g``): the model precomputed the decay (GLM-5.3-Flash's KDA forget
+                     gate is a bounded sigmoid, not a softplus), passed in ``a`` with the
+                     KDA ``[T, HV*K]`` layout; ``A_log``/``dt_bias`` are then unused (may be
+                     None). With ``use_raw_beta`` ``b`` is already post-sigmoid.
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
@@ -323,6 +349,13 @@ def fused_sigmoid_gating_delta_rule_update(
         else 0
     )
 
+    # In raw-g mode the kernel never reads A_log / dt_bias (their loads are behind
+    # ``if not USE_RAW_G``), but its pointer arithmetic is unconditional -- substitute a
+    # tensor that is wide enough to keep the derived addresses in range.
+    if use_raw_g:
+        A_log = a if A_log is None else A_log
+        dt_bias = a if dt_bias is None else dt_bias
+
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
@@ -365,6 +398,8 @@ def fused_sigmoid_gating_delta_rule_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        USE_RAW_G=use_raw_g,
+        USE_RAW_BETA=use_raw_beta,
         num_warps=num_warps,
         num_stages=num_stages,
     )
