@@ -2,7 +2,7 @@
 
 > 本项目是基于 [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken)
 > （Apache License 2.0）的**二次开发版本**。在原版 0.1.2（commit `58f4b9e`）之上，
-> 针对 **Qwen3.8-Flash-Next** 模型补充了双卡张量并行、1M 上下文扩展与图片理解能力。
+> 专注于为 Flash 系列模型（Qwen3.8-Flash-Next、GLM-5.3-Flash、DeepSeek-V4-Flash 等）补充双卡张量并行与图像多模态功能。
 > 上游项目版权归原作者所有，本仓库的修改同样以 Apache 2.0 发布。
 >
 > 上游项目简介：FreeToken 是一个边缘侧 MoE 大模型推理引擎，把 GPU、CPU、内存
@@ -23,8 +23,8 @@
 
 ## 2. 已验证环境与稳定性声明
 
-**特别说明：目前只有 Qwen3.8-Flash-Next（NVFP4 量化版）完成了充分测试，
-包括连续 12 小时长任务运行验证。** GLM-5.3-Flash 与 DeepSeek-V4-Flash 的双卡 TP=2 已在环境 B（2×RTX 5880 Ada）验证通过，详见修订说明。其他模型（MiniMax 等）未在本分支上验证过，请按原版能力对待。
+**特别说明：Qwen3.8-Flash-Next 已经过充分测试（含连续 12 小时长任务）；
+DeepSeek-V4-Flash 与 GLM-5.3-Flash 已在环境 B（2×RTX 5880 Ada）完成短任务测试（含双卡 TP=2 贪婪一致性、多请求稳定性）。** 其他模型（MiniMax 等）未在本分支上验证过，请按原版能力对待。
 
 ## 修订说明
 
@@ -336,6 +336,16 @@ curl http://127.0.0.1:1919/v1/chat/completions \
 双卡的价值是**容量**（1M 上下文、专家/显存分片），速度与单卡基本持平——
 与仓库文档在 5090 D 上的结论一致。
 
+### 7.3 跨模型参考（环境 B：2×RTX 5880 Ada 实测）
+
+下表为环境 B（双卡 TP=2，NCCL socket 传输，decode 为单流贪婪解码实测）：
+
+| 模型 | 单卡 decode | 双卡 TP=2 decode | 显存（每卡，TP=2） | 内存（两进程合计） | 上下文 |
+|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next-NVFP4 | ~22–25 tok/s | ~19–23 tok/s | ~27 GB | ~190 GB | 1M（YaRN off-label） |
+| DeepSeek-V4-Flash | 9.9–11.7 tok/s | 16.5–18.8 tok/s | ~36 GB/卡 | ~155 GB | 256K |
+| GLM-5.3-Flash-NVFP4 | 8.6–8.8 tok/s | 11–12.5 tok/s | ~44 GB/卡 | ~160 GB | 256K |
+
 ---
 
 ## 8. 常见问题与排查
@@ -353,7 +363,7 @@ curl http://127.0.0.1:1919/v1/chat/completions \
 
 ## 9. 注意事项
 
-- **仅 Qwen3.8-Flash-Next 经过充分测试**（含 12 小时长任务）；其他模型未验证
+- **测试覆盖**：Qwen3.8-Flash-Next 已经过充分测试（含 12 小时长任务）；DeepSeek-V4-Flash 与 GLM-5.3-Flash 经过了短任务测试（双卡 TP=2 贪婪一致性 + 多请求稳定性；详见修订说明）
 - 1M 上下文是 YaRN off-label 扩展，官方只背书 256K；超长文本的生成质量请自行评估
 - 图片理解仅支持图片（无 video/audio）；带图请求不进前缀缓存
 - 不能与 DeepSeek-V4-Flash 等其他大模型服务同时运行（内存不足会 OOM 双杀）
