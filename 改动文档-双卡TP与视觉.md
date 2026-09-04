@@ -6,8 +6,18 @@
 
 ## 一、改动总览
 
-共 31 个文件修改（+1172/-90 行）+ 5 个新文件。全部改动未 commit，
-位于分支工作区，可随时回退（见第六节）。
+共 31 个文件修改（+1172/-90 行）+ 5 个新文件。改动已提交并推送至 GitHub
+fork：`github.com/mr1528126360/FreeToken-qwen38` 的 `feat/qwen4-exp-tp-vision`
+分支（首个自研提交 `9b5ee71`，后续文档提交见 git log），可随时回退（见第六节）。
+
+> **2026-09-04 注意事项（ple-backend）**：上游后续提交把 PLE 后端默认值改成了
+> `disk`（`engine/config.py` 中 `ple_backend: str = "disk"`），该路径依赖 C++
+> 扩展 `freetoken.kernel._ple_store`，**但其源码未随仓库提交**，在其他机器上
+> 默认启动会直接 `ImportError: cannot import name '_ple_store' from
+> 'freetoken.kernel'` 崩溃（scheduler 双 rank 同时挂，API 退出）。
+> 本机规避方法：启动命令显式加 `--ple-backend pinned`（原版行为，PLE 表整体
+> 预载入锁页内存）。根治需要补提交 `_ple_store` 的 csrc 与构建配置，
+> 或把默认值改回 `pinned`。本文第二节的启动命令均已带上该参数。
 
 ### 1. 双卡张量并行（TP=2）
 
@@ -86,11 +96,14 @@ cd ~/FreeToken
 ```bash
 nohup .venv/bin/ft serve --model ~/models/Qwen3.8-Flash-Next-NVFP4 \
   --gpu 0 --port 1919 --host 0.0.0.0 \
-  --num-tokens 262144 --moe-cache-size 1024 > ~/freetoken-qwen-serve.log 2>&1 &
+  --num-tokens 262144 --moe-cache-size 1024 \
+  --ple-backend pinned > ~/freetoken-qwen-serve.log 2>&1 &
 ```
 
 - 官方上下文上限 256k，无需 rope 扩展
 - `--moe-cache-size 1024` 必须显式给（否则自动缓存吃满显存，KV 分配 OOM）
+- `--ple-backend pinned` 必须显式给（原因见第一节注意事项：默认的 `disk`
+  后端依赖未提交的 `_ple_store` 扩展，直接启动会崩溃）
 - 如需图片理解，前面加 `FREETOKEN_LOAD_VISION=1`
 
 ### 方式 B：双卡（1M 上下文）
@@ -101,10 +114,12 @@ nohup .venv/bin/ft serve --model ~/models/Qwen3.8-Flash-Next-NVFP4 \
   --tp-size 2 --gpu 0,1 --port 1919 --host 0.0.0.0 \
   --num-tokens 1048576 --max-seq-len-override 1048576 \
   --rope-scaling '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}' \
-  --moe-cache-size 1024 --max-prefill-length 16384 > ~/freetoken-qwen-serve.log 2>&1 &
+  --moe-cache-size 1024 --max-prefill-length 16384 \
+  --ple-backend pinned > ~/freetoken-qwen-serve.log 2>&1 &
 ```
 
 - `--moe-cache-size` 在 TP 下是**每卡**的 slot 数
+- `--ple-backend pinned` 说明同方式 A
 - 加载约 5~8 分钟；就绪判断：`ft ctl health` 显示 `status=ok`
 
 ### 共用说明
@@ -165,11 +180,13 @@ done
 
 ## 六、回退
 
+改动已提交到 `feat/qwen4-exp-tp-vision` 分支（非工作区散改），回退即切回
+上游原版：
+
 ```bash
 cd ~/FreeToken
-git stash                     # 暂存全部改动（含新文件需 git stash -u）
-git checkout main             # 回到官方原版
-# 恢复：git checkout feat/qwen4-exp-tp-vision && git stash pop
+git checkout 58f4b9e     # 上游 FreeToken 0.1.2 原版（本分支的起点）
+# 恢复：git checkout feat/qwen4-exp-tp-vision
 ```
 
 回退后用单卡命令重启验证服务正常即可。原版单卡配置参考 `运行说明-Qwen.md`
